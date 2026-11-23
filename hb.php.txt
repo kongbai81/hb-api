@@ -1,0 +1,206 @@
+
+<?php
+/**
+ * 黄白助手自定义点歌接口 - 网易云最高音质版
+ * 使用：https://你的域名/hb.php?name=七里香
+ */
+
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+
+/* ==================== 配置 ==================== */
+$CFG = [
+    // 推荐填写自己部署的 NeteaseCloudMusicApi 地址，成功率更高
+    'ncm_api'   => '',          // 例如：https://ncm.yourdomain.com
+
+    // 备用 Meting 接口
+    'meting'    => 'https://api.i-meto.com/meting/api',
+
+    'limit'     => 8,
+    'timeout'   => 10,
+    'cache'     => true,
+    'cache_dir' => __DIR__ . '/cache',
+    'cache_ttl' => 7200,        // 缓存2小时
+];
+
+/* ==================== 工具函数 ==================== */
+function hb_out($code, $data = [])
+{
+    echo json_encode([
+        'code'      => $code,
+        'title'     => $data['title']  ?? '',
+        'singer'    => $data['singer'] ?? '',
+        'cover'     => $data['cover']  ?? '',
+        'link'      => $data['link']   ?? '',
+        'music_url' => $data['music']  ?? '',
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function hb_http($url, $timeout = 10)
+{
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        CURLOPT_HTTPHEADER     => [
+            'Referer: https://music.163.com/',
+            'Origin: https://music.163.com'
+        ],
+    ]);
+    $body = curl_exec($ch);
+    curl_close($ch);
+    return $body;
+}
+
+/**
+ * 强制获取最高音质播放链接
+ * 按优先级尝试：hires → lossless → exhigh → higher → standard
+ */
+function hb_get_best_url($base, $songId, $timeout = 10)
+{
+    $levels = ['hires', 'lossless', 'exhigh', 'higher', 'standard'];
+    
+    foreach ($levels as $level) {
+        $url = rtrim($base, '/') . '/song/url/v1?id=' . $songId . '&level=' . $level;
+        $body = hb_http($url, $timeout);
+        $json = json_decode($body, true);
+        
+        if (!empty($json['data'][0]['url'])) {
+            return $json['data'][0]['url'];
+        }
+    }
+    return '';
+}
+
+/* ==================== 主搜索逻辑 ==================== */
+function hb_ncm_search($base, $kw, $limit = 8, $timeout = 10)
+{
+    $base = rtrim($base, '/');
+    $searchUrl = $base . '/search?keywords=' . urlencode($kw) . '&limit=' . $limit . '&type=1';
+    $body = hb_http($searchUrl, $timeout);
+    $json = json_decode($body, true);
+
+    if (empty($json['result']['songs'])) {
+        return null;
+    }
+
+    foreach ($json['result']['songs'] as $song) {
+        $songId = $song['id'] ?? 0;
+        if (!$songId) continue;
+
+        $mp3 = hb_get_best_url($base, $songId, $timeout);
+        if ($mp3 === '') continue;
+
+        // 歌手
+        $artists = [];
+        if (!empty($song['ar'])) {
+            foreach ($song['ar'] as $a) {
+                $artists[] = $a['name'] ?? '';
+            }
+        }
+        $singer = implode('/', array_filter($artists));
+
+        // 封面强制https
+        $cover = '';
+        if (!empty($song['al']['picUrl'])) {
+            $cover = preg_replace('#^http://#i', 'https://', $song['al']['picUrl']);
+        }
+
+        return [
+            'title'  => $song['name'] ?? '',
+            'singer' => $singer,
+            'cover'  => $cover,
+            'link'   => 'https://music.163.com/#/song?id=' . $songId,
+            'music'  => $mp3,
+        ];
+    }
+    return null;
+}
+
+/* ==================== Meting 备用 ==================== */
+function hb_meting($kw, $timeout = 10)
+{
+    global $CFG;
+    $url = rtrim($CFG['meting'], '/') . '/?type=search&id=' . urlencode($kw);
+    $body = hb_http($url, $timeout);
+    $arr = json_decode($body, true);
+    
+    if (!is_array($arr)) return null;
+
+    foreach ($arr as $item) {
+        if (empty($item['url'])) continue;
+        
+        return [
+            'title'  => $item['name'] ?? $item['title'] ?? $kw,
+            'singer' => $item['artist'] ?? $item['author'] ?? '',
+            'cover'  => isset($item['pic']) ? preg_replace('#^http://#i', 'https://', $item['pic']) : '',
+            'link'   => $item['link'] ?? ('https://music.163.com/#/search/m/?s=' . urlencode($kw)),
+            'music'  => preg_replace('#^http://#i', 'https://', $item['url']),
+        ];
+    }
+    return null;
+}
+
+/* ==================== 主程序 ==================== */
+$name = isset($_GET['name']) ? trim($_GET['name']) : '';
+if ($name === '') {
+    hb_out(404);
+}
+
+// 处理双重urlencode
+if (strpos($name, '%') !== false) {
+    $decoded = urldecode($name);
+    if ($decoded !== $name && $decoded !== '') {
+        $name = $decoded;
+    }
+}
+
+// 缓存处理
+$cacheDir  = rtrim($CFG['cache_dir'], '/');
+$cacheFile = $cacheDir . '/' . md5($name) . '.json';
+
+if ($CFG['cache'] && is_dir($cacheDir) && is_file($cacheFile) && (time() - filemtime($cacheFile)) < $CFG['cache_ttl']) {
+    $cached = file_get_contents($cacheFile);
+    if ($cached && json_decode($cached, true)) {
+        echo $cached;
+        exit;
+    }
+}
+
+$payload = null;
+
+// 1. 优先使用 NCM API（最高音质）
+if (!empty($CFG['ncm_api'])) {
+    $payload = hb_ncm_search($CFG['ncm_api'], $name, $CFG['limit'], $CFG['timeout']);
+}
+
+// 2. 备用 Meting
+if (!$payload) {
+    $payload = hb_meting($name, $CFG['timeout']);
+}
+
+// 输出结果
+if ($payload) {
+    $result = [
+        'code'      => 200,
+        'title'     => $payload['title'],
+        'singer'    => $payload['singer'],
+        'cover'     => $payload['cover'],
+        'link'      => $payload['link'],
+        'music_url' => $payload['music'],
+    ];
+
+    // 写入缓存
+    if ($CFG['cache'] && is_dir($cacheDir)) {
+        @file_put_contents($cacheFile, json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    hb_out(200, $payload);
+} else {
+    hb_out(404);
+}
